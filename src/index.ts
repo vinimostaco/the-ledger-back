@@ -23,11 +23,4 @@ app.route("/api/stocks", stocks);
 app.route("/api/watchlist", watchlist);
 app.route("/api/simulate", simulator);
 
-const PORT = parseInt(process.env.PORT ?? "3001");
-
-export default {
-  port: PORT,
-  fetch: app.fetch,
-};
-
-console.log(`🚀 Server running on http://localhost:${PORT}`);
+export default app;

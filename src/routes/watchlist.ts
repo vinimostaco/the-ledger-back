@@ -1,13 +1,11 @@
 import { Hono } from "hono";
-import YahooFinance from "yahoo-finance2";
-const yf = new YahooFinance();
+import { getWatchlistQuotes } from "../services/yahoo";
 import type { WatchlistItem } from "../types/finance";
 
 const watchlist = new Hono();
 
 // In-memory store (per-user key = userId from auth middleware).
 // TODO: replace with a real DB once auth is wired up.
-// The auth middleware should set c.set("userId", "<id>") before these routes.
 const store = new Map<string, Set<string>>();
 
 function getList(userId: string): Set<string> {
@@ -28,17 +26,7 @@ watchlist.get("/", async (c) => {
   if (!tickers.length) return c.json([]);
 
   try {
-    const quotes = await Promise.all(
-      tickers.map((ticker) => yf.quote(ticker))
-    );
-
-    const items: WatchlistItem[] = quotes.map((q: any) => ({
-      ticker: q.symbol ?? "",
-      name: q.longName ?? q.shortName ?? q.symbol ?? "",
-      price: q.regularMarketPrice ?? 0,
-      change: q.regularMarketChangePercent ?? 0,
-    }));
-
+    const items = await getWatchlistQuotes(tickers);
     return c.json(items);
   } catch (err: any) {
     return c.json({ error: err.message ?? "Failed to fetch watchlist" }, 500);

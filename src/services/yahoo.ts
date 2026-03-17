@@ -1,4 +1,3 @@
-import YahooFinance from "yahoo-finance2";
 import type {
   AnnualFinancials,
   DividendEvent,
@@ -7,9 +6,77 @@ import type {
   SimulationResult,
   StockData,
   StockMetrics,
+  WatchlistItem,
 } from "../types/finance";
 
-const yf = new YahooFinance();
+// ─── Yahoo Finance auth (cookie + crumb) ─────────────────────────────────────
+
+let cachedCookie = "";
+let cachedCrumb = "";
+let crumbExpiry = 0;
+
+const USER_AGENT =
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+
+async function refreshCrumb(): Promise<void> {
+  // Step 1: hit fc.yahoo.com to get a cookie
+  const cookieRes = await fetch("https://fc.yahoo.com/", {
+    redirect: "manual",
+    headers: { "User-Agent": USER_AGENT },
+  });
+  // Drain the body
+  await cookieRes.text();
+
+  const setCookie = cookieRes.headers.get("set-cookie") ?? "";
+  cachedCookie = setCookie.split(";")[0] ?? "";
+
+  // Step 2: use the cookie to get a crumb
+  const crumbRes = await fetch(
+    "https://query2.finance.yahoo.com/v1/test/getcrumb",
+    {
+      headers: {
+        "User-Agent": USER_AGENT,
+        Cookie: cachedCookie,
+      },
+    }
+  );
+  cachedCrumb = await crumbRes.text();
+  crumbExpiry = Date.now() + 5 * 60 * 1000; // 5 min cache
+}
+
+async function getCrumb(): Promise<{ cookie: string; crumb: string }> {
+  if (!cachedCrumb || Date.now() > crumbExpiry) {
+    await refreshCrumb();
+  }
+  return { cookie: cachedCookie, crumb: cachedCrumb };
+}
+
+async function yahooFetch(url: string): Promise<any> {
+  const { cookie, crumb } = await getCrumb();
+  const separator = url.includes("?") ? "&" : "?";
+  const fullUrl = `${url}${separator}crumb=${encodeURIComponent(crumb)}`;
+
+  const res = await fetch(fullUrl, {
+    headers: {
+      "User-Agent": USER_AGENT,
+      Cookie: cookie,
+    },
+  });
+
+  if (!res.ok) {
+    // Crumb may have expired, retry once
+    await refreshCrumb();
+    const { cookie: c2, crumb: cr2 } = await getCrumb();
+    const retryUrl = `${url}${separator}crumb=${encodeURIComponent(cr2)}`;
+    const retry = await fetch(retryUrl, {
+      headers: { "User-Agent": USER_AGENT, Cookie: c2 },
+    });
+    if (!retry.ok) throw new Error(`Yahoo Finance API error: ${retry.status}`);
+    return retry.json();
+  }
+
+  return res.json();
+}
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -20,7 +87,7 @@ function getPeriodStart(period = "1Y"): Date {
     case "3M": d.setMonth(d.getMonth() - 3); break;
     case "6M": d.setMonth(d.getMonth() - 6); break;
     case "5Y": d.setFullYear(d.getFullYear() - 5); break;
-    default:   d.setFullYear(d.getFullYear() - 1); // 1Y
+    default:   d.setFullYear(d.getFullYear() - 1);
   }
   return d;
 }
@@ -34,8 +101,12 @@ function formatLargeNumber(n: number): string {
   return n.toFixed(2);
 }
 
-function toDateStr(d: Date | string): string {
+function toDateStr(d: Date | string | number): string {
   return new Date(d).toISOString().split("T")[0];
+}
+
+function toUnix(d: Date): number {
+  return Math.floor(d.getTime() / 1000);
 }
 
 // ─── chart (prices + optional dividends) ────────────────────────────────────
@@ -46,33 +117,91 @@ async function fetchChart(
   period2?: Date,
   includeDividends = false
 ): Promise<{ quotes: HistoricalDataPoint[]; dividends: DividendEvent[] }> {
-  const opts: any = {
-    period1,
-    period2: period2 ?? new Date(),
-    interval: "1d",
-    return: "array",
-  };
-  if (includeDividends) opts.events = "div";
+  const p2 = period2 ?? new Date();
+  let url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?period1=${toUnix(period1)}&period2=${toUnix(p2)}&interval=1d`;
+  if (includeDividends) url += "&events=div";
 
-  const result = await yf.chart(ticker, opts) as any;
+  const data = await yahooFetch(url);
+  const result = data.chart?.result?.[0];
+  if (!result) return { quotes: [], dividends: [] };
 
-  const quotes: HistoricalDataPoint[] = (result.quotes ?? []).map((q: any) => ({
-    date:   toDateStr(q.date),
-    open:   q.open   ?? 0,
-    high:   q.high   ?? 0,
-    low:    q.low    ?? 0,
-    close:  q.close  ?? 0,
-    volume: q.volume ?? 0,
+  const timestamps: number[] = result.timestamp ?? [];
+  const ohlcv = result.indicators?.quote?.[0] ?? {};
+
+  const quotes: HistoricalDataPoint[] = timestamps.map((ts, i) => ({
+    date:   toDateStr(ts * 1000),
+    open:   ohlcv.open?.[i]   ?? 0,
+    high:   ohlcv.high?.[i]   ?? 0,
+    low:    ohlcv.low?.[i]    ?? 0,
+    close:  ohlcv.close?.[i]  ?? 0,
+    volume: ohlcv.volume?.[i] ?? 0,
   }));
 
-  const dividends: DividendEvent[] = includeDividends
-    ? (result.events?.dividends ?? []).map((d: any) => ({
-        date:   toDateStr(d.date),
-        amount: d.amount ?? 0,
-      }))
-    : [];
+  const dividends: DividendEvent[] = [];
+  if (includeDividends && result.events?.dividends) {
+    const divObj = result.events.dividends;
+    for (const key of Object.keys(divObj)) {
+      dividends.push({
+        date:   toDateStr(divObj[key].date * 1000),
+        amount: divObj[key].amount ?? 0,
+      });
+    }
+    dividends.sort((a, b) => a.date.localeCompare(b.date));
+  }
 
   return { quotes, dividends };
+}
+
+// ─── quote ──────────────────────────────────────────────────────────────────
+
+async function fetchQuote(ticker: string): Promise<any> {
+  const data = await yahooFetch(
+    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`
+  );
+  return data.quoteResponse?.result?.[0] ?? {};
+}
+
+export async function fetchQuotes(tickers: string[]): Promise<any[]> {
+  const data = await yahooFetch(
+    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(tickers.join(","))}`
+  );
+  return data.quoteResponse?.result ?? [];
+}
+
+// ─── quoteSummary ───────────────────────────────────────────────────────────
+
+async function fetchQuoteSummary(
+  ticker: string,
+  modules: string[]
+): Promise<any> {
+  const data = await yahooFetch(
+    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules.join(",")}`
+  );
+  return data.quoteSummary?.result?.[0] ?? {};
+}
+
+// ─── fundamentals timeseries ────────────────────────────────────────────────
+
+async function fetchTimeSeries(
+  ticker: string,
+  types: string[],
+  period1: Date
+): Promise<any[]> {
+  const url = `https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(ticker)}?type=${types.join(",")}&period1=${toUnix(period1)}&period2=${toUnix(new Date())}`;
+  const data = await yahooFetch(url);
+  return data.timeseries?.result ?? [];
+}
+
+function extractTimeSeries(
+  results: any[],
+  typeKey: string
+): { date: string; value: number | null }[] {
+  const series = results.find((r: any) => r.meta?.type?.[0] === typeKey);
+  if (!series?.[typeKey]) return [];
+  return series[typeKey].map((entry: any) => ({
+    date: entry.asOfDate ?? "",
+    value: entry.reportedValue?.raw ?? null,
+  }));
 }
 
 // ─── history ────────────────────────────────────────────────────────────────
@@ -103,88 +232,108 @@ export async function getFundamentals(
   const fiveYearsAgo = new Date();
   fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
 
-  const [
-    annualFinancials,
-    annualCashflow,
-    quarterlyFinancials,
-    quarterlyCashflow,
-    summary,
-  ] = await Promise.all([
-    yf.fundamentalsTimeSeries(ticker, { module: "financials", type: "annual",    period1: fiveYearsAgo }) as any,
-    yf.fundamentalsTimeSeries(ticker, { module: "cash-flow",  type: "annual",    period1: fiveYearsAgo }) as any,
-    yf.fundamentalsTimeSeries(ticker, { module: "financials", type: "quarterly", period1: fiveYearsAgo }) as any,
-    yf.fundamentalsTimeSeries(ticker, { module: "cash-flow",  type: "quarterly", period1: fiveYearsAgo }) as any,
-    yf.quoteSummary(ticker, {
-      modules: ["financialData", "defaultKeyStatistics", "summaryDetail"],
-    }),
+  const annualTypes = [
+    "annualTotalRevenue", "annualNetIncome", "annualBasicEPS",
+    "annualFreeCashFlow", "annualOperatingCashFlow",
+  ];
+  const quarterlyTypes = [
+    "quarterlyTotalRevenue", "quarterlyNetIncome", "quarterlyBasicEPS",
+    "quarterlyFreeCashFlow", "quarterlyOperatingCashFlow",
+  ];
+
+  const [annualResults, quarterlyResults, summary] = await Promise.all([
+    fetchTimeSeries(ticker, annualTypes, fiveYearsAgo),
+    fetchTimeSeries(ticker, quarterlyTypes, fiveYearsAgo),
+    fetchQuoteSummary(ticker, [
+      "financialData",
+      "defaultKeyStatistics",
+      "summaryDetail",
+    ]),
   ]);
 
-  const fd = summary.financialData as any;
-  const ks = summary.defaultKeyStatistics as any;
-  const sd = summary.summaryDetail as any;
+  const fd = summary.financialData ?? {};
+  const ks = summary.defaultKeyStatistics ?? {};
+  const sd = summary.summaryDetail ?? {};
 
-  // Map date → cashflow row for quick lookup
-  function cfMap(rows: any[]): Map<string, any> {
-    const m = new Map<string, any>();
-    for (const r of rows) m.set(toDateStr(r.date), r);
-    return m;
+  function val(obj: any): number | null {
+    if (obj == null) return null;
+    if (typeof obj === "number") return obj;
+    return obj.raw ?? obj.fmt ? parseFloat(obj.fmt) : null;
   }
 
-  function buildFinancials(incRows: any[], cfRows: any[]): AnnualFinancials[] {
-    const cf = cfMap(cfRows);
-    return incRows
-      .map((inc: any) => {
-        const dateStr = toDateStr(inc.date);
-        const c = cf.get(dateStr) ?? {};
-        return {
-          date:             dateStr,
-          totalRevenue:     inc.totalRevenue     ?? null,
-          netIncome:        inc.netIncome        ?? null,
-          basicEPS:         inc.basicEPS         ?? null,
-          freeCashFlow:     c.freeCashFlow       ?? null,
-          dividendPerShare: null,
-          operatingCashFlow: c.cashFlowFromContinuingOperatingActivities ?? c.operatingCashFlow ?? null,
-        };
-      })
-      .sort((a, b) => a.date.localeCompare(b.date)); // oldest → newest
+  function buildFinancials(
+    results: any[],
+    prefix: "annual" | "quarterly"
+  ): AnnualFinancials[] {
+    const revenue = extractTimeSeries(results, `${prefix}TotalRevenue`);
+    const income = extractTimeSeries(results, `${prefix}NetIncome`);
+    const eps = extractTimeSeries(results, `${prefix}BasicEPS`);
+    const fcf = extractTimeSeries(results, `${prefix}FreeCashFlow`);
+    const ocf = extractTimeSeries(results, `${prefix}OperatingCashFlow`);
+
+    // Collect all unique dates
+    const dates = new Set<string>();
+    for (const arr of [revenue, income, eps, fcf, ocf]) {
+      for (const item of arr) if (item.date) dates.add(item.date);
+    }
+
+    const lookup = (arr: { date: string; value: number | null }[], date: string) =>
+      arr.find((x) => x.date === date)?.value ?? null;
+
+    return Array.from(dates)
+      .sort()
+      .map((date) => ({
+        date,
+        totalRevenue: lookup(revenue, date),
+        netIncome: lookup(income, date),
+        basicEPS: lookup(eps, date),
+        freeCashFlow: lookup(fcf, date),
+        dividendPerShare: null,
+        operatingCashFlow: lookup(ocf, date),
+      }));
   }
 
   return {
-    marketCap:        sd?.marketCap        ?? null,
-    trailingPE:       sd?.trailingPE       ?? null,
-    trailingEPS:      ks?.trailingEps      ?? null,
-    totalRevenue:     fd?.totalRevenue     ?? null,
-    netIncome:        fd?.netIncome        ?? null,
-    profitMargin:     fd?.profitMargins    ?? null,
-    freeCashFlow:     fd?.freeCashflow     ?? null,
-    operatingCashFlow: fd?.operatingCashflow ?? null,
-    returnOnEquity:   fd?.returnOnEquity   ?? null,
-    totalDebt:        fd?.totalDebt        ?? null,
-    netDebt:          fd?.netDebt          ?? null,
-    debtToEquity:     fd?.debtToEquity     ?? null,
-    bookValue:        ks?.bookValue        ?? null,
-    priceToBook:      ks?.priceToBook      ?? null,
-    sharesOutstanding: ks?.sharesOutstanding ?? null,
-    dividendRate:     sd?.dividendRate     ?? null,
-    dividendYield:    sd?.dividendYield    ?? null,
-    payoutRatio:      sd?.payoutRatio      ?? null,
-    currency:         fd?.financialCurrency ?? "USD",
-    annualFinancials:    buildFinancials(annualFinancials,    annualCashflow),
-    quarterlyFinancials: buildFinancials(quarterlyFinancials.slice(-8), quarterlyCashflow),
+    marketCap:         val(sd.marketCap),
+    trailingPE:        val(sd.trailingPE),
+    trailingEPS:       val(ks.trailingEps),
+    totalRevenue:      val(fd.totalRevenue),
+    netIncome:         val(fd.netIncome),
+    profitMargin:      val(fd.profitMargins),
+    freeCashFlow:      val(fd.freeCashflow),
+    operatingCashFlow: val(fd.operatingCashflow),
+    returnOnEquity:    val(fd.returnOnEquity),
+    totalDebt:         val(fd.totalDebt),
+    netDebt:           val(fd.netDebt),
+    debtToEquity:      val(fd.debtToEquity),
+    bookValue:         val(ks.bookValue),
+    priceToBook:       val(ks.priceToBook),
+    sharesOutstanding: val(ks.sharesOutstanding),
+    dividendRate:      val(sd.dividendRate),
+    dividendYield:     val(sd.dividendYield),
+    payoutRatio:       val(sd.payoutRatio),
+    currency:          fd.financialCurrency ?? "USD",
+    annualFinancials:    buildFinancials(annualResults, "annual"),
+    quarterlyFinancials: buildFinancials(quarterlyResults, "quarterly").slice(-8),
   };
 }
 
 // ─── metrics ────────────────────────────────────────────────────────────────
 
 export async function getMetrics(ticker: string): Promise<StockMetrics> {
-  const [quote, summary] = await Promise.all([
-    yf.quote(ticker),
-    yf.quoteSummary(ticker, { modules: ["defaultKeyStatistics", "summaryDetail"] }),
+  const [q, summary] = await Promise.all([
+    fetchQuote(ticker),
+    fetchQuoteSummary(ticker, ["defaultKeyStatistics", "summaryDetail"]),
   ]);
 
-  const q  = quote as any;
-  const ks = summary.defaultKeyStatistics as any;
-  const sd = summary.summaryDetail as any;
+  const ks = summary.defaultKeyStatistics ?? {};
+  const sd = summary.summaryDetail ?? {};
+
+  function val(obj: any): number {
+    if (obj == null) return 0;
+    if (typeof obj === "number") return obj;
+    return obj.raw ?? 0;
+  }
 
   return {
     ticker,
@@ -193,14 +342,14 @@ export async function getMetrics(ticker: string): Promise<StockMetrics> {
     change:        q.regularMarketChange         ?? 0,
     changePercent: q.regularMarketChangePercent  ?? 0,
     marketCap:     formatLargeNumber(q.marketCap ?? 0),
-    peRatio:       q.trailingPE ?? sd?.trailingPE ?? 0,
-    eps:           ks?.trailingEps               ?? 0,
-    dividend:      sd?.dividendRate              ?? 0,
+    peRatio:       q.trailingPE ?? val(sd.trailingPE),
+    eps:           val(ks.trailingEps),
+    dividend:      val(sd.dividendRate),
     high52w:       q.fiftyTwoWeekHigh            ?? 0,
     low52w:        q.fiftyTwoWeekLow             ?? 0,
     volume:        formatLargeNumber(q.regularMarketVolume        ?? 0),
     avgVolume:     formatLargeNumber(q.averageDailyVolume3Month ?? q.averageDailyVolume10Day ?? 0),
-    beta:          ks?.beta                      ?? 0,
+    beta:          val(ks.beta),
   };
 }
 
@@ -250,7 +399,6 @@ export async function simulate(
 
   if (!quotes.length) throw new Error(`No historical data found for ${ticker}`);
 
-  // First trading day of each month → that month's entry price
   const monthMap = new Map<string, number>();
   for (const row of quotes) {
     const ym = row.date.slice(0, 7);
@@ -261,7 +409,6 @@ export async function simulate(
   let shares = 0;
   let totalInvested = 0;
 
-  // year index → last state in that year (end-of-year snapshot)
   const yearlyMap = new Map<number, { invested: number; balance: number }>();
 
   for (const [ym, price] of monthMap) {
@@ -286,4 +433,18 @@ export async function simulate(
     totalInvested > 0 ? ((last.balance - totalInvested) / totalInvested) * 100 : 0;
 
   return { totalInvested, finalBalance: last.balance, totalReturn, data };
+}
+
+// ─── watchlist helper ───────────────────────────────────────────────────────
+
+export async function getWatchlistQuotes(
+  tickers: string[]
+): Promise<WatchlistItem[]> {
+  const quotes = await fetchQuotes(tickers);
+  return quotes.map((q: any) => ({
+    ticker: q.symbol ?? "",
+    name:   q.longName ?? q.shortName ?? q.symbol ?? "",
+    price:  q.regularMarketPrice ?? 0,
+    change: q.regularMarketChangePercent ?? 0,
+  }));
 }
