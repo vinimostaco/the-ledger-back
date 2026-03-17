@@ -109,6 +109,26 @@ function toUnix(d: Date): number {
   return Math.floor(d.getTime() / 1000);
 }
 
+// ─── ticker normalization ────────────────────────────────────────────────────
+
+// Brazilian stocks on Yahoo Finance require the .SA suffix (e.g. ITUB3.SA).
+// If the ticker has no exchange suffix, we try it as-is first, then retry with .SA.
+function withSaSuffix(ticker: string): string {
+  return ticker.includes(".") ? ticker : `${ticker}.SA`;
+}
+
+// Resolves a ticker by probing the quote endpoint; returns the ticker with .SA
+// appended if the bare ticker returns no result.
+async function resolveTicker(ticker: string): Promise<string> {
+  if (ticker.includes(".")) return ticker;
+  const data = await yahooFetch(
+    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`
+  );
+  const result = data.quoteResponse?.result?.[0];
+  if (result) return ticker;
+  return withSaSuffix(ticker);
+}
+
 // ─── chart (prices + optional dividends) ────────────────────────────────────
 
 async function fetchChart(
@@ -212,7 +232,8 @@ export async function getHistory(
   ticker: string,
   period = "1Y"
 ): Promise<HistoricalDataPoint[]> {
-  const { quotes } = await fetchChart(ticker, getPeriodStart(period));
+  const sym = await resolveTicker(ticker);
+  const { quotes } = await fetchChart(sym, getPeriodStart(period));
   return quotes;
 }
 
@@ -222,7 +243,8 @@ export async function getDividends(
   ticker: string,
   period = "1Y"
 ): Promise<DividendEvent[]> {
-  const { dividends } = await fetchChart(ticker, getPeriodStart(period), undefined, true);
+  const sym = await resolveTicker(ticker);
+  const { dividends } = await fetchChart(sym, getPeriodStart(period), undefined, true);
   return dividends;
 }
 
@@ -231,6 +253,7 @@ export async function getDividends(
 export async function getFundamentals(
   ticker: string
 ): Promise<FundamentalsData> {
+  const sym = await resolveTicker(ticker);
   const fiveYearsAgo = new Date();
   fiveYearsAgo.setFullYear(fiveYearsAgo.getFullYear() - 5);
 
@@ -244,9 +267,9 @@ export async function getFundamentals(
   ];
 
   const [annualResults, quarterlyResults, summary] = await Promise.all([
-    fetchTimeSeries(ticker, annualTypes, fiveYearsAgo),
-    fetchTimeSeries(ticker, quarterlyTypes, fiveYearsAgo),
-    fetchQuoteSummary(ticker, [
+    fetchTimeSeries(sym, annualTypes, fiveYearsAgo),
+    fetchTimeSeries(sym, quarterlyTypes, fiveYearsAgo),
+    fetchQuoteSummary(sym, [
       "financialData",
       "defaultKeyStatistics",
       "summaryDetail",
@@ -323,9 +346,10 @@ export async function getFundamentals(
 // ─── metrics ────────────────────────────────────────────────────────────────
 
 export async function getMetrics(ticker: string): Promise<StockMetrics> {
+  const sym = await resolveTicker(ticker);
   const [q, summary] = await Promise.all([
-    fetchQuote(ticker),
-    fetchQuoteSummary(ticker, ["defaultKeyStatistics", "summaryDetail"]),
+    fetchQuote(sym),
+    fetchQuoteSummary(sym, ["defaultKeyStatistics", "summaryDetail"]),
   ]);
 
   const ks = summary.defaultKeyStatistics ?? {};
@@ -361,9 +385,10 @@ export async function getStockData(
   ticker: string,
   period = "1Y"
 ): Promise<StockData> {
+  const sym = await resolveTicker(ticker);
   const [{ quotes: historical, dividends }, fundamentals] = await Promise.all([
-    fetchChart(ticker, getPeriodStart(period), undefined, true),
-    getFundamentals(ticker),
+    fetchChart(sym, getPeriodStart(period), undefined, true),
+    getFundamentals(sym),
   ]);
   return { ticker, historical, dividends, fundamentals };
 }
@@ -380,9 +405,10 @@ export async function compareStocks(
 
   return Promise.all(
     tickers.map(async (ticker) => {
+      const sym = await resolveTicker(ticker);
       const [{ quotes: historical, dividends }, fundamentals] = await Promise.all([
-        fetchChart(ticker, period1, period2, true),
-        getFundamentals(ticker),
+        fetchChart(sym, period1, period2, true),
+        getFundamentals(sym),
       ]);
       return { ticker, historical, dividends, fundamentals };
     })
