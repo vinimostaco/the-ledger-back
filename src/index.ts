@@ -20,15 +20,6 @@ function isRateLimited(ip: string, limit: number, windowMs: number): boolean {
   return false;
 }
 
-// Prune stale entries every 5 minutes to prevent unbounded memory growth
-setInterval(() => {
-  const cutoff = Date.now() - 60_000;
-  for (const [ip, timestamps] of rateLimitWindows) {
-    const fresh = timestamps.filter(t => t > cutoff);
-    if (fresh.length === 0) rateLimitWindows.delete(ip);
-    else rateLimitWindows.set(ip, fresh);
-  }
-}, 5 * 60 * 1000);
 
 app.use("*", logger());
 app.use(
