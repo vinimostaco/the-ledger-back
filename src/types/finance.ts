@@ -77,6 +77,28 @@ export interface WatchlistItem {
   change: number;
 }
 
+export interface CompanyProfile {
+  ticker: string;
+  name: string;
+  sector: string;
+  industry: string;
+  description: string;
+  website: string;
+  fullTimeEmployees: number | null;
+  country: string;
+  city: string;
+  logo: string;
+}
+
+export interface CompanyNewsItem {
+  title: string;
+  url: string;
+  source: string;
+  publishedAt: string;
+  thumbnail: string;
+  summary: string;
+}
+
 export interface SimulationResult {
   totalInvested: number;
   finalBalance: number;

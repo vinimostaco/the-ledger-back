@@ -1,5 +1,7 @@
 import type {
   AnnualFinancials,
+  CompanyNewsItem,
+  CompanyProfile,
   DividendEvent,
   FundamentalsData,
   HistoricalDataPoint,
@@ -14,6 +16,7 @@ import type {
 let cachedCookie = "";
 let cachedCrumb = "";
 let crumbExpiry = 0;
+let crumbPromise: Promise<void> | null = null; // mutex: prevents parallel refreshes
 
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
@@ -23,6 +26,7 @@ async function refreshCrumb(): Promise<void> {
   const cookieRes = await fetch("https://fc.yahoo.com/", {
     redirect: "manual",
     headers: { "User-Agent": USER_AGENT },
+    signal: AbortSignal.timeout(10_000),
   });
   // Drain the body
   await cookieRes.text();
@@ -38,6 +42,7 @@ async function refreshCrumb(): Promise<void> {
         "User-Agent": USER_AGENT,
         Cookie: cachedCookie,
       },
+      signal: AbortSignal.timeout(10_000),
     }
   );
   cachedCrumb = await crumbRes.text();
@@ -46,7 +51,10 @@ async function refreshCrumb(): Promise<void> {
 
 async function getCrumb(): Promise<{ cookie: string; crumb: string }> {
   if (!cachedCrumb || Date.now() > crumbExpiry) {
-    await refreshCrumb();
+    if (!crumbPromise) {
+      crumbPromise = refreshCrumb().finally(() => { crumbPromise = null; });
+    }
+    await crumbPromise;
   }
   return { cookie: cachedCookie, crumb: cachedCrumb };
 }
@@ -61,6 +69,7 @@ async function yahooFetch(url: string): Promise<any> {
       "User-Agent": USER_AGENT,
       Cookie: cookie,
     },
+    signal: AbortSignal.timeout(10_000),
   });
 
   if (!res.ok) {
@@ -70,12 +79,26 @@ async function yahooFetch(url: string): Promise<any> {
     const retryUrl = `${url}${separator}crumb=${encodeURIComponent(cr2)}`;
     const retry = await fetch(retryUrl, {
       headers: { "User-Agent": USER_AGENT, Cookie: c2 },
+      signal: AbortSignal.timeout(10_000),
     });
     if (!retry.ok) throw new Error(`Yahoo Finance API error: ${retry.status}`);
     return retry.json();
   }
 
   return res.json();
+}
+
+// ─── TTL cache ───────────────────────────────────────────────────────────────
+
+const cache = new Map<string, { data: unknown; expiry: number }>();
+
+function cached<T>(key: string, ttlMs: number, fn: () => Promise<T>): Promise<T> {
+  const entry = cache.get(key);
+  if (entry && Date.now() < entry.expiry) return Promise.resolve(entry.data as T);
+  return fn().then(data => {
+    cache.set(key, { data, expiry: Date.now() + ttlMs });
+    return data;
+  });
 }
 
 // ─── helpers ────────────────────────────────────────────────────────────────
@@ -109,6 +132,21 @@ function toUnix(d: Date): number {
   return Math.floor(d.getTime() / 1000);
 }
 
+// ─── val helpers ─────────────────────────────────────────────────────────────
+
+function valOrNull(obj: any): number | null {
+  if (obj == null) return null;
+  if (typeof obj === "number") return obj;
+  if (obj.raw != null) return obj.raw;
+  return null;
+}
+
+function valOrZero(obj: any): number {
+  if (obj == null) return 0;
+  if (typeof obj === "number") return obj;
+  return obj.raw ?? 0;
+}
+
 // ─── ticker normalization ────────────────────────────────────────────────────
 
 // Brazilian stocks on Yahoo Finance require the .SA suffix (e.g. ITUB3.SA).
@@ -118,15 +156,16 @@ function withSaSuffix(ticker: string): string {
 }
 
 // Resolves a ticker by probing the quote endpoint; returns the ticker with .SA
-// appended if the bare ticker returns no result.
+// appended if the bare ticker returns no result. Cached for 24h.
 async function resolveTicker(ticker: string): Promise<string> {
   if (ticker.includes(".")) return ticker;
-  const data = await yahooFetch(
-    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`
-  );
-  const result = data.quoteResponse?.result?.[0];
-  if (result) return ticker;
-  return withSaSuffix(ticker);
+  return cached(`resolve:${ticker}`, 24 * 60 * 60 * 1000, async () => {
+    const data = await yahooFetch(
+      `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`
+    );
+    const result = data.quoteResponse?.result?.[0];
+    return result ? ticker : withSaSuffix(ticker);
+  });
 }
 
 // ─── chart (prices + optional dividends) ────────────────────────────────────
@@ -138,49 +177,53 @@ async function fetchChart(
   includeDividends = false
 ): Promise<{ quotes: HistoricalDataPoint[]; dividends: DividendEvent[] }> {
   const p2 = period2 ?? new Date();
-  let url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?period1=${toUnix(period1)}&period2=${toUnix(p2)}&interval=1d`;
-  if (includeDividends) url += "&events=div";
+  const key = `chart:${ticker}:${toUnix(period1)}:${toUnix(p2)}:${includeDividends}`;
+  return cached(key, 5 * 60 * 1000, async () => {
+    let url = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?period1=${toUnix(period1)}&period2=${toUnix(p2)}&interval=1d`;
+    if (includeDividends) url += "&events=div";
 
-  const data = await yahooFetch(url);
-  const result = data.chart?.result?.[0];
-  if (!result) return { quotes: [], dividends: [] };
+    const data = await yahooFetch(url);
+    const result = data.chart?.result?.[0];
+    if (!result) return { quotes: [], dividends: [] };
 
-  const timestamps: number[] = result.timestamp ?? [];
-  const ohlcv = result.indicators?.quote?.[0] ?? {};
+    const timestamps: number[] = result.timestamp ?? [];
+    const ohlcv = result.indicators?.quote?.[0] ?? {};
 
-  const quotes: HistoricalDataPoint[] = timestamps
-    .map((ts, i) => ({
-      date:   toDateStr(ts * 1000),
-      open:   ohlcv.open?.[i]   ?? 0,
-      high:   ohlcv.high?.[i]   ?? 0,
-      low:    ohlcv.low?.[i]    ?? 0,
-      close:  ohlcv.close?.[i]  ?? 0,
-      volume: ohlcv.volume?.[i] ?? 0,
-    }))
-    .filter((q) => q.close > 0);
+    const quotes: HistoricalDataPoint[] = timestamps
+      .map((ts, i) => ({
+        date:   toDateStr(ts * 1000),
+        open:   ohlcv.open?.[i]   ?? 0,
+        high:   ohlcv.high?.[i]   ?? 0,
+        low:    ohlcv.low?.[i]    ?? 0,
+        close:  ohlcv.close?.[i]  ?? 0,
+        volume: ohlcv.volume?.[i] ?? 0,
+      }))
+      .filter((q) => q.close > 0);
 
-  const dividends: DividendEvent[] = [];
-  if (includeDividends && result.events?.dividends) {
-    const divObj = result.events.dividends;
-    for (const key of Object.keys(divObj)) {
-      dividends.push({
-        date:   toDateStr(divObj[key].date * 1000),
-        amount: divObj[key].amount ?? 0,
-      });
+    const dividends: DividendEvent[] = [];
+    if (includeDividends && result.events?.dividends) {
+      const divObj = result.events.dividends;
+      for (const k of Object.keys(divObj)) {
+        dividends.push({
+          date:   toDateStr(divObj[k].date * 1000),
+          amount: divObj[k].amount ?? 0,
+        });
+      }
+      dividends.sort((a, b) => a.date.localeCompare(b.date));
     }
-    dividends.sort((a, b) => a.date.localeCompare(b.date));
-  }
 
-  return { quotes, dividends };
+    return { quotes, dividends };
+  });
 }
 
 // ─── quote ──────────────────────────────────────────────────────────────────
 
 async function fetchQuote(ticker: string): Promise<any> {
-  const data = await yahooFetch(
-    `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`
+  return cached(`quote:${ticker}`, 30 * 1000, () =>
+    yahooFetch(
+      `https://query2.finance.yahoo.com/v7/finance/quote?symbols=${encodeURIComponent(ticker)}`
+    ).then(data => data.quoteResponse?.result?.[0] ?? {})
   );
-  return data.quoteResponse?.result?.[0] ?? {};
 }
 
 export async function fetchQuotes(tickers: string[]): Promise<any[]> {
@@ -196,10 +239,12 @@ async function fetchQuoteSummary(
   ticker: string,
   modules: string[]
 ): Promise<any> {
-  const data = await yahooFetch(
-    `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules.join(",")}`
+  const key = `summary:${ticker}:${modules.join(",")}`;
+  return cached(key, 15 * 60 * 1000, () =>
+    yahooFetch(
+      `https://query2.finance.yahoo.com/v10/finance/quoteSummary/${encodeURIComponent(ticker)}?modules=${modules.join(",")}`
+    ).then(data => data.quoteSummary?.result?.[0] ?? {})
   );
-  return data.quoteSummary?.result?.[0] ?? {};
 }
 
 // ─── fundamentals timeseries ────────────────────────────────────────────────
@@ -209,9 +254,11 @@ async function fetchTimeSeries(
   types: string[],
   period1: Date
 ): Promise<any[]> {
-  const url = `https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(ticker)}?type=${types.join(",")}&period1=${toUnix(period1)}&period2=${toUnix(new Date())}`;
-  const data = await yahooFetch(url);
-  return data.timeseries?.result ?? [];
+  const key = `timeseries:${ticker}:${types.join(",")}:${toUnix(period1)}`;
+  return cached(key, 30 * 60 * 1000, () => {
+    const url = `https://query2.finance.yahoo.com/ws/fundamentals-timeseries/v1/finance/timeseries/${encodeURIComponent(ticker)}?type=${types.join(",")}&period1=${toUnix(period1)}&period2=${toUnix(new Date())}`;
+    return yahooFetch(url).then(data => data.timeseries?.result ?? []);
+  });
 }
 
 function extractTimeSeries(
@@ -280,63 +327,61 @@ export async function getFundamentals(
   const ks = summary.defaultKeyStatistics ?? {};
   const sd = summary.summaryDetail ?? {};
 
-  function val(obj: any): number | null {
-    if (obj == null) return null;
-    if (typeof obj === "number") return obj;
-    return obj.raw ?? obj.fmt ? parseFloat(obj.fmt) : null;
-  }
-
   function buildFinancials(
     results: any[],
     prefix: "annual" | "quarterly"
   ): AnnualFinancials[] {
     const revenue = extractTimeSeries(results, `${prefix}TotalRevenue`);
-    const income = extractTimeSeries(results, `${prefix}NetIncome`);
-    const eps = extractTimeSeries(results, `${prefix}BasicEPS`);
-    const fcf = extractTimeSeries(results, `${prefix}FreeCashFlow`);
-    const ocf = extractTimeSeries(results, `${prefix}OperatingCashFlow`);
+    const income  = extractTimeSeries(results, `${prefix}NetIncome`);
+    const eps     = extractTimeSeries(results, `${prefix}BasicEPS`);
+    const fcf     = extractTimeSeries(results, `${prefix}FreeCashFlow`);
+    const ocf     = extractTimeSeries(results, `${prefix}OperatingCashFlow`);
 
-    // Collect all unique dates
     const dates = new Set<string>();
     for (const arr of [revenue, income, eps, fcf, ocf]) {
       for (const item of arr) if (item.date) dates.add(item.date);
     }
 
-    const lookup = (arr: { date: string; value: number | null }[], date: string) =>
-      arr.find((x) => x.date === date)?.value ?? null;
+    const toMap = (arr: { date: string; value: number | null }[]) =>
+      new Map(arr.map(x => [x.date, x.value]));
+    const revMap = toMap(revenue);
+    const incMap = toMap(income);
+    const epsMap = toMap(eps);
+    const fcfMap = toMap(fcf);
+    const ocfMap = toMap(ocf);
 
     return Array.from(dates)
       .sort()
       .map((date) => ({
         date,
-        totalRevenue: lookup(revenue, date),
-        netIncome: lookup(income, date),
-        basicEPS: lookup(eps, date),
-        freeCashFlow: lookup(fcf, date),
-        dividendPerShare: null,
-        operatingCashFlow: lookup(ocf, date),
+        totalRevenue:      revMap.get(date) ?? null,
+        netIncome:         incMap.get(date) ?? null,
+        basicEPS:          epsMap.get(date) ?? null,
+        freeCashFlow:      fcfMap.get(date) ?? null,
+        dividendPerShare:  null,
+        operatingCashFlow: ocfMap.get(date) ?? null,
       }));
   }
 
   return {
-    marketCap:         val(sd.marketCap),
-    trailingPE:        val(sd.trailingPE),
-    trailingEPS:       val(ks.trailingEps),
-    totalRevenue:      val(fd.totalRevenue),
-    netIncome:         val(fd.netIncome),
-    profitMargin:      val(fd.profitMargins),
-    freeCashFlow:      val(fd.freeCashflow),
-    operatingCashFlow: val(fd.operatingCashflow),
-    returnOnEquity:    val(fd.returnOnEquity),
-    totalDebt:         val(fd.totalDebt),
-    netDebt:           val(fd.netDebt),
-    debtToEquity:      val(fd.debtToEquity),
-    bookValue:         val(ks.bookValue),
-    priceToBook:       val(ks.priceToBook),
-    sharesOutstanding: val(ks.sharesOutstanding),
-    dividendRate:      val(sd.dividendRate),
-    dividendYield:     val(sd.dividendYield),
-    payoutRatio:       val(sd.payoutRatio),
+    marketCap:         valOrNull(sd.marketCap),
+    trailingPE:        valOrNull(sd.trailingPE),
+    trailingEPS:       valOrNull(ks.trailingEps),
+    totalRevenue:      valOrNull(fd.totalRevenue),
+    netIncome:         valOrNull(fd.netIncome),
+    profitMargin:      valOrNull(fd.profitMargins),
+    freeCashFlow:      valOrNull(fd.freeCashflow),
+    operatingCashFlow: valOrNull(fd.operatingCashflow),
+    returnOnEquity:    valOrNull(fd.returnOnEquity),
+    totalDebt:         valOrNull(fd.totalDebt),
+    netDebt:           valOrNull(fd.netDebt),
+    debtToEquity:      valOrNull(fd.debtToEquity),
+    bookValue:         valOrNull(ks.bookValue),
+    priceToBook:       valOrNull(ks.priceToBook),
+    sharesOutstanding: valOrNull(ks.sharesOutstanding),
+    dividendRate:      valOrNull(sd.dividendRate),
+    dividendYield:     valOrNull(sd.dividendYield),
+    payoutRatio:       valOrNull(sd.payoutRatio),
     currency:          fd.financialCurrency ?? "USD",
     annualFinancials:    buildFinancials(annualResults, "annual"),
     quarterlyFinancials: buildFinancials(quarterlyResults, "quarterly").slice(-8),
@@ -355,12 +400,6 @@ export async function getMetrics(ticker: string): Promise<StockMetrics> {
   const ks = summary.defaultKeyStatistics ?? {};
   const sd = summary.summaryDetail ?? {};
 
-  function val(obj: any): number {
-    if (obj == null) return 0;
-    if (typeof obj === "number") return obj;
-    return obj.raw ?? 0;
-  }
-
   return {
     ticker,
     name:          q.longName ?? q.shortName ?? ticker,
@@ -368,14 +407,14 @@ export async function getMetrics(ticker: string): Promise<StockMetrics> {
     change:        q.regularMarketChange         ?? 0,
     changePercent: q.regularMarketChangePercent  ?? 0,
     marketCap:     formatLargeNumber(q.marketCap ?? 0),
-    peRatio:       q.trailingPE ?? val(sd.trailingPE),
-    eps:           val(ks.trailingEps),
-    dividend:      val(sd.dividendRate),
+    peRatio:       q.trailingPE ?? valOrZero(sd.trailingPE),
+    eps:           valOrZero(ks.trailingEps),
+    dividend:      valOrZero(sd.dividendRate),
     high52w:       q.fiftyTwoWeekHigh            ?? 0,
     low52w:        q.fiftyTwoWeekLow             ?? 0,
     volume:        formatLargeNumber(q.regularMarketVolume        ?? 0),
     avgVolume:     formatLargeNumber(q.averageDailyVolume3Month ?? q.averageDailyVolume10Day ?? 0),
-    beta:          val(ks.beta),
+    beta:          valOrZero(ks.beta),
   };
 }
 
@@ -423,7 +462,8 @@ export async function simulate(
   startDate: string,
   endDate: string
 ): Promise<SimulationResult> {
-  const { quotes } = await fetchChart(ticker, new Date(startDate), new Date(endDate));
+  const sym = await resolveTicker(ticker);
+  const { quotes } = await fetchChart(sym, new Date(startDate), new Date(endDate));
 
   if (!quotes.length) throw new Error(`No historical data found for ${ticker}`);
 
@@ -464,6 +504,61 @@ export async function simulate(
 }
 
 // ─── watchlist helper ───────────────────────────────────────────────────────
+
+// ─── company profile ─────────────────────────────────────────────────────
+
+export async function getCompanyProfile(
+  ticker: string
+): Promise<CompanyProfile> {
+  const sym = await resolveTicker(ticker);
+  const [summary, quote] = await Promise.all([
+    fetchQuoteSummary(sym, ["assetProfile"]),
+    fetchQuote(sym),
+  ]);
+
+  const profile = summary.assetProfile ?? {};
+
+  return {
+    ticker,
+    name: quote.longName ?? quote.shortName ?? ticker,
+    sector: profile.sector ?? "",
+    industry: profile.industry ?? "",
+    description: profile.longBusinessSummary ?? "",
+    website: profile.website ?? "",
+    fullTimeEmployees: profile.fullTimeEmployees ?? null,
+    country: profile.country ?? "",
+    city: profile.city ?? "",
+    logo: `https://logo.clearbit.com/${(profile.website ?? "").replace(/^https?:\/\//, "").replace(/\/.*$/, "")}`,
+  };
+}
+
+// ─── company news ────────────────────────────────────────────────────────
+
+export async function getCompanyNews(
+  ticker: string
+): Promise<CompanyNewsItem[]> {
+  const sym = await resolveTicker(ticker);
+  const key = `news:${sym}`;
+  return cached(key, 15 * 60 * 1000, async () => {
+    const data = await yahooFetch(
+      `https://query2.finance.yahoo.com/v1/finance/search?q=${encodeURIComponent(sym)}&newsCount=10&quotesCount=0&enableFuzzyQuery=false`
+    );
+
+    const newsItems = data.news ?? [];
+    return newsItems.map((item: any) => ({
+      title: item.title ?? "",
+      url: item.link ?? "",
+      source: item.publisher ?? "",
+      publishedAt: item.providerPublishTime
+        ? new Date(item.providerPublishTime * 1000).toISOString()
+        : "",
+      thumbnail: item.thumbnail?.resolutions?.[0]?.url ?? "",
+      summary: item.summary ?? "",
+    }));
+  });
+}
+
+// ─── watchlist helper ───────────────────────────────────────────────────
 
 export async function getWatchlistQuotes(
   tickers: string[]

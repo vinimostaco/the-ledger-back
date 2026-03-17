@@ -3,6 +3,8 @@ import { simulate } from "../services/yahoo";
 
 const simulator = new Hono();
 
+const TICKER_RE = /^[A-Z0-9]{1,10}(\.[A-Z]{1,4})?$/;
+
 // POST /api/simulate
 // Body: { ticker, monthlyAmount, startDate, endDate }
 simulator.post("/", async (c) => {
@@ -19,16 +21,16 @@ simulator.post("/", async (c) => {
   if (!startDate || !endDate)
     return c.json({ error: "startDate and endDate are required" }, 400);
 
+  const normalizedTicker = ticker.trim().toUpperCase();
+  if (!TICKER_RE.test(normalizedTicker))
+    return c.json({ error: "Invalid ticker format" }, 400);
+
   try {
-    const result = await simulate(
-      ticker.trim().toUpperCase(),
-      monthlyAmount,
-      startDate,
-      endDate
-    );
+    const result = await simulate(normalizedTicker, monthlyAmount, startDate, endDate);
     return c.json(result);
   } catch (err: any) {
-    return c.json({ error: err.message ?? "Simulation failed" }, 500);
+    const status = err.status ?? 500;
+    return c.json({ error: err.message ?? "Simulation failed" }, status);
   }
 });
 
