@@ -128,14 +128,16 @@ async function fetchChart(
   const timestamps: number[] = result.timestamp ?? [];
   const ohlcv = result.indicators?.quote?.[0] ?? {};
 
-  const quotes: HistoricalDataPoint[] = timestamps.map((ts, i) => ({
-    date:   toDateStr(ts * 1000),
-    open:   ohlcv.open?.[i]   ?? 0,
-    high:   ohlcv.high?.[i]   ?? 0,
-    low:    ohlcv.low?.[i]    ?? 0,
-    close:  ohlcv.close?.[i]  ?? 0,
-    volume: ohlcv.volume?.[i] ?? 0,
-  }));
+  const quotes: HistoricalDataPoint[] = timestamps
+    .map((ts, i) => ({
+      date:   toDateStr(ts * 1000),
+      open:   ohlcv.open?.[i]   ?? 0,
+      high:   ohlcv.high?.[i]   ?? 0,
+      low:    ohlcv.low?.[i]    ?? 0,
+      close:  ohlcv.close?.[i]  ?? 0,
+      volume: ohlcv.volume?.[i] ?? 0,
+    }))
+    .filter((q) => q.close > 0);
 
   const dividends: DividendEvent[] = [];
   if (includeDividends && result.events?.dividends) {
