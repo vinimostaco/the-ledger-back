@@ -4,6 +4,7 @@ import { logger } from "hono/logger";
 import stocks from "./routes/stocks";
 import watchlist from "./routes/watchlist";
 import simulator from "./routes/simulator";
+import macro from "./routes/macro";
 
 const app = new Hono();
 
@@ -47,10 +48,19 @@ app.use("/api/simulate/*", async (c, next) => {
   return next();
 });
 
+// Macro: 30 req/min per IP (external BCB API, cached)
+app.use("/api/macro/*", async (c, next) => {
+  const ip = c.req.header("x-forwarded-for")?.split(",")[0].trim() ?? "unknown";
+  if (isRateLimited(ip, 30, 60_000))
+    return c.json({ error: "Too many requests" }, 429);
+  return next();
+});
+
 app.get("/", (c) => c.json({ status: "ok", service: "the-ledger-back" }));
 
 app.route("/api/stocks", stocks);
 app.route("/api/watchlist", watchlist);
 app.route("/api/simulate", simulator);
+app.route("/api/macro", macro);
 
 export default app;

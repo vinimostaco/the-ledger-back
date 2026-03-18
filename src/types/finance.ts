@@ -99,6 +99,32 @@ export interface CompanyNewsItem {
   summary: string;
 }
 
+export interface MacroDataPoint {
+  date: string;  // YYYY-MM-DD
+  value: number;
+}
+
+export interface MacroIndicatorSnapshot {
+  label: string;
+  unit: string;
+  value: number;
+  date: string;
+}
+
+export interface MacroOverview {
+  selic: MacroIndicatorSnapshot;
+  ipca: MacroIndicatorSnapshot;
+  igpm: MacroIndicatorSnapshot;
+  usd_brl: MacroIndicatorSnapshot;
+}
+
+export interface MacroHistoryResponse {
+  indicator: string;
+  label: string;
+  unit: string;
+  history: MacroDataPoint[];
+}
+
 export interface SimulationResult {
   totalInvested: number;
   finalBalance: number;
